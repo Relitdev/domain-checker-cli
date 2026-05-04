@@ -194,19 +194,21 @@ func verifyOrigin(domain, originIP string, isProxied bool) {
 	req, _ := http.NewRequest("GET", "http://"+domain, nil)
 	resp, err := client.Do(req)
 	
+	httpOk := false
 	if err != nil {
 		fmt.Printf("❌ HTTP failed: %v\n", err)
 	} else {
 		defer resp.Body.Close()
-		if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-			fmt.Printf("✅ HTTP OK (Origin is replying)\n")
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			fmt.Printf("✅ %d OK (Sesuai)\n", resp.StatusCode)
+			httpOk = true
 		} else {
-			fmt.Printf("⚠️  HTTP Status %d\n", resp.StatusCode)
+			fmt.Printf("⚠️  %d (Merespons tapi status error)\n", resp.StatusCode)
 		}
 	}
 
 	// 2. Check Origin SSL (on port 443)
-	fmt.Print("   🔒 Origin SSL: ")
+	fmt.Print("   🔒 Origin SSL:  ")
 	conf := &tls.Config{
 		ServerName:         domain,
 		InsecureSkipVerify: true,
@@ -214,7 +216,8 @@ func verifyOrigin(domain, originIP string, isProxied bool) {
 	
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", originIP+":443", conf)
 	if err != nil {
-		fmt.Printf("❌ Failed to connect: %v\n", err)
+		fmt.Printf("❌ Gagal connect ke port 443: %v\n", err)
+		printVerdict(false, false, isProxied)
 		return
 	}
 	defer conn.Close()
@@ -235,10 +238,9 @@ func verifyOrigin(domain, originIP string, isProxied bool) {
 	}
 
 	if dnsMatch {
-		fmt.Printf("✅ Active (Expires on %s)\n", expiry.Format("2006-01-02"))
+		fmt.Printf("✅ Match (Expires %s)\n", expiry.Format("2006-01-02"))
 	} else {
-		fmt.Printf("⚠️  MISMATCH (Expires on %s)\n", expiry.Format("2006-01-02"))
-		fmt.Printf("      ⚠️  Warning: Domain tidak cocok dengan sertifikat di IP ini!\n")
+		fmt.Printf("❌ MISMATCH (Sertifikat untuk: %s)\n", cert.Subject.CommonName)
 	}
 
 	fmt.Printf("      📝 Subject: %s\n", cert.Subject.CommonName)
@@ -248,8 +250,20 @@ func verifyOrigin(domain, originIP string, isProxied bool) {
 		fmt.Printf("      🏢 Issuer:  %s\n", cert.Issuer.CommonName)
 	}
 	
-	if isProxied {
-		fmt.Println("   💡 Info: SSL yang anda lihat di atas adalah SSL asli di server Anda (Origin).")
-		fmt.Println("      Sedangkan SSL di hasil awal adalah SSL milik Cloudflare (Edge).")
+	printVerdict(httpOk, dnsMatch, isProxied)
+}
+
+func printVerdict(httpOk, sslMatch bool, isProxied bool) {
+	fmt.Print("\n   🚩 KESIMPULAN: ")
+	if httpOk && sslMatch {
+		fmt.Println("🌟 INTEGRASI SEMPURNA! Ini adalah Origin yang benar.")
+	} else if sslMatch {
+		fmt.Println("🌗 SETENGAH COCOK. SSL benar tapi HTTP error (mungkin firewall/config server).")
+	} else {
+		fmt.Println("🚫 BUKAN ORIGIN. IP ini tidak melayani domain Anda dengan benar.")
+	}
+
+	if isProxied && (httpOk || sslMatch) {
+		fmt.Println("      (Trafik publik disembunyikan Cloudflare, tapi di dalam pointing sudah benar)")
 	}
 }
