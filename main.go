@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -45,14 +47,16 @@ func main() {
 		fmt.Printf("  checkdomain -domain <domain> [opsi lainnya]\n\n")
 		fmt.Printf("OPSI:\n")
 		fmt.Print("  -domain string\n")
-		fmt.Print("    	Nama Domain yang ingin dicek (contoh: google.com atau web.desa.id)\n")
+		fmt.Print("    \tNama Domain yang ingin dicek (contoh: google.com atau web.desa.id)\n")
 		fmt.Print("  -origin string\n")
-		fmt.Print("    	Alamat IP server asli (Origin IP) untuk verifikasi pointing dan SSL asli\n")
+		fmt.Print("    \tAlamat IP server asli (Origin IP) untuk verifikasi pointing dan SSL asli\n")
 		fmt.Printf("\nCONTOH:\n")
 		fmt.Printf("  checkdomain -domain google.com\n")
 		fmt.Printf("  checkdomain -domain opendesa.id -origin 103.154.142.172\n\n")
 		fmt.Printf("FITUR:\n")
 		fmt.Printf("  ✅ Cek status dan masa berlaku SSL (HTTPs)\n")
+		fmt.Printf("  📅 Cek masa berlaku domain (expired atau masih aktif) via WHOIS\n")
+		fmt.Printf("  🧭 Cek NS (Nameserver) untuk domain\n")
 		fmt.Printf("  🌐 Cek IP Pointing (A/AAAA Records) dengan label Cloudflare\n")
 		fmt.Printf("  ☁️  Deteksi status Proxy Cloudflare (Orange Cloud)\n")
 		fmt.Printf("  🎯 Verifikasi Origin IP (memastikan pointing Cloudflare benar ke server Anda)\n")
@@ -73,13 +77,19 @@ func main() {
 	// 1. SSL Check
 	checkSSL(*domain)
 
-	// 2. DNS Pointing Check
+	// 2. Domain Expiry Check
+	checkDomainExpiry(*domain)
+
+	// 3. NS Lookup
+	checkNS(*domain)
+
+	// 4. DNS Pointing Check
 	ips := checkDNS(*domain)
 
-	// 3. Cloudflare Check
+	// 5. Cloudflare Check
 	isCF := checkCloudflare(*domain, ips)
 
-	// 4. Origin Verification
+	// 6. Origin Verification
 	if *expectedOrigin != "" {
 		verifyOrigin(*domain, *expectedOrigin, isCF)
 	} else if isCF {
@@ -90,18 +100,28 @@ func main() {
 	fmt.Println(strings.Repeat("-", 40))
 }
 
+func normalizeDomain(domain string) string {
+	trimmed := strings.TrimSpace(domain)
+	trimmed = strings.TrimPrefix(trimmed, "http://")
+	trimmed = strings.TrimPrefix(trimmed, "https://")
+	trimmed = strings.TrimSuffix(trimmed, "/")
+	trimmed = strings.Trim(trimmed, "/")
+	trimmed = strings.TrimSpace(trimmed)
+	return strings.ToLower(trimmed)
+}
+
 func checkSSL(domain string) {
+	domain = normalizeDomain(domain)
 	fmt.Print("🔒 SSL Status: ")
-	// Use port 443 for SSL check
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", domain+":443", &tls.Config{InsecureSkipVerify: true})
 	if err != nil {
-		fmt.Printf("❌ Failed to connect: %v\n", err)
+		fmt.Printf("❌ Tidak bisa konek ke HTTPS: %v\n", err)
 		return
 	}
 	defer conn.Close()
 
 	if len(conn.ConnectionState().PeerCertificates) == 0 {
-		fmt.Println("❌ No certificates found")
+		fmt.Println("❌ Tidak ada sertifikat TLS yang dikembalikan")
 		return
 	}
 
@@ -109,15 +129,179 @@ func checkSSL(domain string) {
 	expiry := cert.NotAfter
 	now := time.Now()
 
-	fmt.Printf("✅ Active (Expires on %s)\n", expiry.Format("2006-01-02"))
-	fmt.Printf("   📝 Subject: %s\n", cert.Subject.CommonName)
-	fmt.Printf("   🏢 Issuer:  %s\n", cert.Issuer.Organization[0])
-
 	if now.After(expiry) {
-		fmt.Printf("   🔴 STATUS:  EXPIRED (since %s)\n", expiry.Format("2006-01-02"))
-	} else {
-		daysRemaining := int(expiry.Sub(now).Hours() / 24)
-		fmt.Printf("   ⏳ Sisa:    %d hari\n", daysRemaining)
+		fmt.Printf("❌ EXPIRED (kadaluarsa pada %s)\n", expiry.Format("2006-01-02"))
+		fmt.Printf("   🔴 STATUS: domain sudah tidak memiliki sertifikat SSL yang aktif\n")
+		return
+	}
+
+	fmt.Printf("✅ Active (kadaluarsa %s)\n", expiry.Format("2006-01-02"))
+	fmt.Printf("   📝 Subject: %s\n", cert.Subject.CommonName)
+	if len(cert.Issuer.Organization) > 0 {
+		fmt.Printf("   🏢 Issuer:  %s\n", cert.Issuer.Organization[0])
+	} else if cert.Issuer.CommonName != "" {
+		fmt.Printf("   🏢 Issuer:  %s\n", cert.Issuer.CommonName)
+	}
+
+	daysRemaining := int(time.Until(expiry).Hours() / 24)
+	fmt.Printf("   ⏳ Sisa:    %d hari\n", daysRemaining)
+}
+
+func checkDomainExpiry(domain string) {
+	domain = normalizeDomain(domain)
+	fmt.Print("📅 Domain Expiry: ")
+
+	expiry, err := lookupDomainExpiry(domain)
+	if err != nil {
+		fmt.Printf("⚠️  %v\n", err)
+		return
+	}
+
+	if expiry.IsZero() {
+		fmt.Println("⚠️  Tidak ada data expiry yang bisa dideteksi dari WHOIS")
+		return
+	}
+
+	now := time.Now()
+	if now.After(expiry) {
+		fmt.Printf("❌ EXPIRED (expired pada %s)\n", expiry.Format("2006-01-02"))
+		return
+	}
+
+	daysRemaining := int(time.Until(expiry).Hours() / 24)
+	fmt.Printf("✅ Active (berlaku sampai %s)\n", expiry.Format("2006-01-02"))
+	fmt.Printf("   ⏳ Sisa:    %d hari\n", daysRemaining)
+}
+
+func lookupDomainExpiry(domain string) (time.Time, error) {
+	whoisServer := whoisServerForDomain(domain)
+	if whoisServer == "" {
+		return time.Time{}, fmt.Errorf("server WHOIS untuk domain %s tidak ditemukan", domain)
+	}
+
+	conn, err := net.DialTimeout("tcp", whoisServer+":43", 5*time.Second)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("gagal menghubungi WHOIS %s: %w", whoisServer, err)
+	}
+	defer conn.Close()
+
+	if _, err = fmt.Fprintf(conn, domain+"\r\n"); err != nil {
+		return time.Time{}, fmt.Errorf("gagal mengirim query ke WHOIS: %w", err)
+	}
+
+	response, err := io.ReadAll(conn)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("gagal membaca respon WHOIS: %w", err)
+	}
+
+	text := string(response)
+	if strings.Contains(strings.ToLower(text), "no match") || strings.Contains(strings.ToLower(text), "not found") || strings.Contains(strings.ToLower(text), "not registered") {
+		return time.Time{}, fmt.Errorf("domain belum terdaftar atau tidak ditemukan di WHOIS")
+	}
+
+	expiry, ok := parseWhoisExpiry(text)
+	if !ok {
+		return time.Time{}, fmt.Errorf("domain ditemukan, tetapi tanggal expiry tidak bisa dibaca dari WHOIS")
+	}
+
+	return expiry, nil
+}
+
+func whoisServerForDomain(domain string) string {
+	lower := strings.ToLower(domain)
+	servers := []struct {
+		suffix string
+		server string
+	}{
+		{".co.id", "whois.co.id"},
+		{".go.id", "whois.kemenag.go.id"},
+		{".ac.id", "whois.ac.id"},
+		{".id", "whois.pandi.or.id"},
+		{".com", "whois.verisign-grs.com"},
+		{".net", "whois.verisign-grs.com"},
+		{".org", "whois.publicinterestregistry.org"},
+		{".info", "whois.afilias.net"},
+		{".io", "whois.nic.io"},
+		{".me", "whois.nic.me"},
+		{".biz", "whois.nic.biz"},
+		{".my", "whois.mynic.my"},
+		{".xyz", "whois.nic.xyz"},
+	}
+
+	for _, candidate := range servers {
+		if strings.HasSuffix(lower, candidate.suffix) {
+			return candidate.server
+		}
+	}
+
+	return "whois.iana.org"
+}
+
+func parseWhoisExpiry(text string) (time.Time, bool) {
+	patterns := []string{
+		`(?i)(?:Registry Expiry Date|Domain Expiration Date|Expiration Date|Expiry Date|Expires On|Registrar Registration Expiration Date)\s*[:=]\s*([^\r\n]+)`,
+		`(?i)(?:paid-till|renewal date|renewal-date|expires)\s*[:=]\s*([^\r\n]+)`,
+		`(?i)(?:Registry Expiry|Domain Expiration|Expiration)\s*[:=]\s*([^\r\n]+)`,
+	}
+
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		matches := re.FindStringSubmatch(text)
+		if len(matches) < 2 {
+			continue
+		}
+		value := strings.TrimSpace(matches[1])
+		if value == "" {
+			continue
+		}
+		value = strings.Trim(value, "\"'")
+		if ts, ok := parseDateValue(value); ok {
+			return ts, true
+		}
+	}
+
+	return time.Time{}, false
+}
+
+func parseDateValue(raw string) (time.Time, bool) {
+	cleaned := strings.TrimSpace(strings.TrimSuffix(raw, "."))
+	cleaned = strings.TrimSuffix(cleaned, " UTC")
+	cleaned = strings.TrimSuffix(cleaned, " GMT")
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+		"2006/01/02",
+		"2006.01.02",
+	}
+
+	for _, layout := range formats {
+		if ts, err := time.Parse(layout, cleaned); err == nil {
+			return ts.UTC(), true
+		}
+	}
+
+	return time.Time{}, false
+}
+
+func checkNS(domain string) {
+	domain = normalizeDomain(domain)
+	fmt.Print("🧭 NS Lookup: ")
+	ns, err := net.LookupNS(domain)
+	if err != nil {
+		fmt.Printf("❌ %v\n", err)
+		return
+	}
+
+	if len(ns) == 0 {
+		fmt.Println("❌ Tidak ada Nameserver yang ditemukan")
+		return
+	}
+
+	fmt.Println()
+	for _, record := range ns {
+		fmt.Printf("   - %s\n", record.Host)
 	}
 }
 
