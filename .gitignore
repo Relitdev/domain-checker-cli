@@ -16,3 +16,6 @@ checkdomain
 # Go
 vendor/
 go.sum
+
+# Local config (lihat config/config.yml.example)
+config/config.yml
