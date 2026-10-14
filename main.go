@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -42,7 +44,7 @@ func isCloudflareIP(ipStr string) bool {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Printf("🚀 Domain Checker CLI - Hubungi kami di opendesa.id jika ada kendala\n\n")
+		fmt.Printf("🚀 Domain Checker CLI\n\n")
 		fmt.Printf("PENGGUNAAN:\n")
 		fmt.Printf("  checkdomain -domain <domain> [opsi lainnya]\n\n")
 		fmt.Printf("OPSI:\n")
@@ -50,19 +52,29 @@ func main() {
 		fmt.Print("    \tNama Domain yang ingin dicek (contoh: google.com atau web.desa.id)\n")
 		fmt.Print("  -origin string\n")
 		fmt.Print("    \tAlamat IP server asli (Origin IP) untuk verifikasi pointing dan SSL asli\n")
+		fmt.Print("  -url string\n")
+		fmt.Print("    \tURL khusus untuk cek uptime (hanya URL ini yang dicek, config diabaikan)\n")
+		fmt.Print("  -config string\n")
+		fmt.Print("    \tPath file YAML berisi daftar URL uptime (opsional, hanya dibaca jika diisi)\n")
 		fmt.Printf("\nCONTOH:\n")
 		fmt.Printf("  checkdomain -domain google.com\n")
-		fmt.Printf("  checkdomain -domain opendesa.id -origin 103.154.142.172\n\n")
+		fmt.Printf("  checkdomain -domain example.id -origin 103.154.142.172\n")
+		fmt.Printf("  checkdomain -domain example.com -url https://example.com/login\n")
+		fmt.Printf("  checkdomain -domain example.com -config config/config.yml\n\n")
 		fmt.Printf("FITUR:\n")
-		fmt.Printf("  ✅ Cek status dan masa berlaku SSL (HTTPs)\n")
+		fmt.Printf("  ✅ Cek status dan masa berlaku SSL (HTTPS) + SAN\n")
+		fmt.Printf("  🔗 Verifikasi trust chain browser (AUTHORITY/COMMON_NAME/DATE_INVALID)\n")
 		fmt.Printf("  📅 Cek masa berlaku domain (expired atau masih aktif) via WHOIS\n")
 		fmt.Printf("  🧭 Cek NS (Nameserver) untuk domain\n")
+		fmt.Printf("  🩺 Cek uptime cepat dan status HTTP (200/3xx/4xx/5xx)\n")
 		fmt.Printf("  🌐 Cek IP Pointing (A/AAAA Records) dengan label Cloudflare\n")
 		fmt.Printf("  ☁️  Deteksi status Proxy Cloudflare (Orange Cloud)\n")
 		fmt.Printf("  🎯 Verifikasi Origin IP (memastikan pointing Cloudflare benar ke server Anda)\n")
 	}
 
 	domain := flag.String("domain", "", "Domain to check")
+	customURL := flag.String("url", "", "Custom URL for quick uptime test")
+	configPath := flag.String("config", "", "Path to optional uptime config YAML (hanya dibaca jika diisi)")
 	expectedOrigin := flag.String("origin", "", "Expected origin IP")
 	flag.Parse()
 
@@ -80,16 +92,19 @@ func main() {
 	// 2. Domain Expiry Check
 	checkDomainExpiry(*domain)
 
-	// 3. NS Lookup
+	// 3. Uptime / quick status check
+	checkUptime(*domain, *customURL, *configPath)
+
+	// 4. NS Lookup
 	checkNS(*domain)
 
-	// 4. DNS Pointing Check
+	// 5. DNS Pointing Check
 	ips := checkDNS(*domain)
 
-	// 5. Cloudflare Check
+	// 6. Cloudflare Check
 	isCF := checkCloudflare(*domain, ips)
 
-	// 6. Origin Verification
+	// 7. Origin Verification
 	if *expectedOrigin != "" {
 		verifyOrigin(*domain, *expectedOrigin, isCF)
 	} else if isCF {
@@ -113,7 +128,7 @@ func normalizeDomain(domain string) string {
 func checkSSL(domain string) {
 	domain = normalizeDomain(domain)
 	fmt.Print("🔒 SSL Status: ")
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", domain+":443", &tls.Config{InsecureSkipVerify: true})
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", domain+":443", &tls.Config{InsecureSkipVerify: true, ServerName: domain})
 	if err != nil {
 		fmt.Printf("❌ Tidak bisa konek ke HTTPS: %v\n", err)
 		return
@@ -125,18 +140,23 @@ func checkSSL(domain string) {
 		return
 	}
 
-	cert := conn.ConnectionState().PeerCertificates[0]
+	certs := conn.ConnectionState().PeerCertificates
+	cert := certs[0]
 	expiry := cert.NotAfter
 	now := time.Now()
 
 	if now.After(expiry) {
 		fmt.Printf("❌ EXPIRED (kadaluarsa pada %s)\n", expiry.Format("2006-01-02"))
 		fmt.Printf("   🔴 STATUS: domain sudah tidak memiliki sertifikat SSL yang aktif\n")
+		fmt.Printf("   🌐 Browser: net::ERR_CERT_DATE_INVALID\n")
 		return
 	}
 
 	fmt.Printf("✅ Active (kadaluarsa %s)\n", expiry.Format("2006-01-02"))
 	fmt.Printf("   📝 Subject: %s\n", cert.Subject.CommonName)
+	if len(cert.DNSNames) > 0 {
+		fmt.Printf("   🔖 SAN:     %s\n", strings.Join(cert.DNSNames, ", "))
+	}
 	if len(cert.Issuer.Organization) > 0 {
 		fmt.Printf("   🏢 Issuer:  %s\n", cert.Issuer.Organization[0])
 	} else if cert.Issuer.CommonName != "" {
@@ -145,13 +165,69 @@ func checkSSL(domain string) {
 
 	daysRemaining := int(time.Until(expiry).Hours() / 24)
 	fmt.Printf("   ⏳ Sisa:    %d hari\n", daysRemaining)
+
+	checkTrustChain(domain, cert, certs)
+}
+
+func isSelfSigned(cert *x509.Certificate) bool {
+	if cert.Subject.String() == cert.Issuer.String() {
+		return true
+	}
+	return cert.CheckSignatureFrom(cert) == nil
+}
+
+func checkTrustChain(domain string, leaf *x509.Certificate, chain []*x509.Certificate) {
+	fmt.Print("   🔗 Chain:   ")
+	if isSelfSigned(leaf) {
+		fmt.Println("❌ TIDAK DIPERCAYA BROWSER (net::ERR_CERT_AUTHORITY_INVALID)")
+		fmt.Printf("      Penyebab: self-signed (Subject == Issuer: %s)\n", leaf.Subject.CommonName)
+		fmt.Println("      Solusi: pasang sertifikat dari CA publik (misal Let's Encrypt) di server/IP tujuan")
+		return
+	}
+
+	intermediates := x509.NewCertPool()
+	for _, c := range chain[1:] {
+		intermediates.AddCert(c)
+	}
+	opts := x509.VerifyOptions{
+		DNSName:       domain,
+		Intermediates: intermediates,
+	}
+
+	if _, err := leaf.Verify(opts); err != nil {
+		var unknownErr x509.UnknownAuthorityError
+		var hostnameErr x509.HostnameError
+		var invalidErr x509.CertificateInvalidError
+		switch {
+		case errors.As(err, &unknownErr):
+			fmt.Println("❌ TIDAK DIPERCAYA BROWSER (net::ERR_CERT_AUTHORITY_INVALID)")
+			fmt.Printf("      Penyebab: %v\n", err)
+		case errors.As(err, &hostnameErr):
+			fmt.Println("❌ TIDAK DIPERCAYA BROWSER (net::ERR_CERT_COMMON_NAME_INVALID)")
+			fmt.Printf("      Penyebab: hostname tidak cocok: %v\n", err)
+		case errors.As(err, &invalidErr) && invalidErr.Reason == x509.Expired:
+			fmt.Println("❌ TIDAK DIPERCAYA BROWSER (net::ERR_CERT_DATE_INVALID)")
+			fmt.Printf("      Penyebab: %v\n", err)
+		default:
+			fmt.Printf("❌ TIDAK DIPERCAYA BROWSER (%v)\n", err)
+		}
+		fmt.Println("      Solusi: cek chain/intermediate, pastikan fullchain terpasang dan CN/SAN mencakup domain ini")
+		return
+	}
+
+	fmt.Println("✅ Dipercaya (rantai valid ke root CA sistem)")
 }
 
 func checkDomainExpiry(domain string) {
 	domain = normalizeDomain(domain)
 	fmt.Print("📅 Domain Expiry: ")
 
-	expiry, err := lookupDomainExpiry(domain)
+	target := registrableDomain(domain)
+	if target != domain {
+		fmt.Printf("\n   ℹ️  %s adalah subdomain, cek WHOIS ke parent %s\n   ", domain, target)
+	}
+
+	expiry, err := lookupDomainExpiry(target)
 	if err != nil {
 		fmt.Printf("⚠️  %v\n", err)
 		return
@@ -205,6 +281,33 @@ func lookupDomainExpiry(domain string) (time.Time, error) {
 	}
 
 	return expiry, nil
+}
+
+// registrableDomain mengembalikan domain yang terdaftar di WHOIS (eTLD+1
+// versi ringan tanpa dependensi eksternal). Contoh: sabintulung.desa.id -> desa.id,
+// sub.example.co.id -> example.co.id, deep.sub.example.com -> example.com.
+func registrableDomain(domain string) string {
+	lower := strings.ToLower(strings.TrimSpace(domain))
+	labels := strings.Split(lower, ".")
+	if len(labels) <= 2 {
+		return lower
+	}
+
+	// Second-level .id yang registrasinya di tingkat 3 (contoh: example.co.id).
+	secondLevelID := map[string]bool{
+		"co.id": true, "go.id": true, "ac.id": true, "or.id": true,
+		"sch.id": true, "mil.id": true, "web.id": true, "my.id": true,
+		"biz.id": true, "net.id": true, "ponpes.id": true,
+	}
+	suffix2 := strings.Join(labels[len(labels)-2:], ".")
+	if secondLevelID[suffix2] {
+		if len(labels) >= 3 {
+			return strings.Join(labels[len(labels)-3:], ".")
+		}
+		return lower
+	}
+
+	return strings.Join(labels[len(labels)-2:], ".")
 }
 
 func whoisServerForDomain(domain string) string {
@@ -303,6 +406,97 @@ func checkNS(domain string) {
 	for _, record := range ns {
 		fmt.Printf("   - %s\n", record.Host)
 	}
+}
+
+func checkUptime(domain, customURL, configPath string) {
+	urls := loadUptimeTargets(domain, customURL, configPath)
+	if len(urls) == 0 {
+		fmt.Println("🩺 Uptime Check: ❌ Tidak ada URL yang bisa diperiksa")
+		return
+	}
+
+	fmt.Println("🩺 Uptime Check:")
+	for _, target := range urls {
+		fmt.Printf("   - %s -> ", target)
+		statusCode, err := quickHTTPStatus(target)
+		if err != nil {
+			fmt.Printf("❌ %v\n", err)
+			continue
+		}
+
+		switch {
+		case statusCode >= 200 && statusCode < 300:
+			fmt.Printf("✅ %d OK\n", statusCode)
+		case statusCode >= 300 && statusCode < 400:
+			fmt.Printf("↩️  %d Redirect\n", statusCode)
+		case statusCode >= 400 && statusCode < 500:
+			fmt.Printf("⚠️  %d Client Error\n", statusCode)
+		case statusCode >= 500:
+			fmt.Printf("🚨 %d Server Error\n", statusCode)
+		default:
+			fmt.Printf("ℹ️  %d\n", statusCode)
+		}
+	}
+}
+
+func loadUptimeTargets(domain, customURL, configPath string) []string {
+	if customURL != "" {
+		return []string{normalizeURL(customURL)}
+	}
+
+	var urls []string
+	if configPath != "" {
+		if data, err := os.ReadFile(configPath); err == nil {
+			for _, match := range regexp.MustCompile(`(?m)^\s*[-:]?\s*(?:url|endpoint|site|target)\s*[:=]\s*(https?://\S+)`).FindAllStringSubmatch(string(data), -1) {
+				if len(match) > 1 {
+					urls = append(urls, normalizeURL(match[1]))
+				}
+			}
+			for _, match := range regexp.MustCompile(`(?m)^\s*-\s*(https?://\S+)`).FindAllStringSubmatch(string(data), -1) {
+				if len(match) > 1 {
+					urls = append(urls, normalizeURL(match[1]))
+				}
+			}
+		}
+	}
+
+	if len(urls) == 0 {
+		urls = append(urls, normalizeURL("https://"+normalizeDomain(domain)))
+	}
+
+	return uniqueStrings(urls)
+}
+
+func normalizeURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	trimmed = strings.Trim(trimmed, "\"'")
+	if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+		return trimmed
+	}
+	return "https://" + trimmed
+}
+
+func uniqueStrings(items []string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		result = append(result, item)
+	}
+	return result
+}
+
+func quickHTTPStatus(target string) (int, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(target)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, nil
 }
 
 func checkDNS(domain string) []string {

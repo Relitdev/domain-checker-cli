@@ -6,9 +6,10 @@ Program CLI sederhana dalam bahasa Go untuk mengecek status SSL, masa berlaku do
 1. **SSL Check**: Mengecek apakah sertifikat SSL masih aktif atau sudah expired, serta menampilkan tanggal kadaluarsanya.
 2. **Domain Expiry Check**: Mengecek apakah nama domain masih aktif atau sudah expired berdasarkan data WHOIS/registrar (bukan status website atau DNS).
 3. **NS Lookup**: Menampilkan Nameserver (NS) yang menangani domain tersebut.
-4. **DNS Pointing**: Menampilkan IP address yang diarahkan oleh domain (A/AAAA Records).
-5. **Cloudflare Detection**: Mendeteksi apakah domain menggunakan proxy Cloudflare (Orange Cloud) berdasarkan range IP dan header response.
-6. **Origin Verification**: Memastikan domain yang menggunakan Cloudflare benar-benar mengarah ke IP server asli kita dengan melakukan direct request menggunakan Host header spoofing.
+4. **Quick Uptime Check**: Mengecek status HTTP cepat seperti `200 OK`, `301`, `404`, `500`, dan status lain dari endpoint utama.
+5. **DNS Pointing**: Menampilkan IP address yang diarahkan oleh domain (A/AAAA Records).
+6. **Cloudflare Detection**: Mendeteksi apakah domain menggunakan proxy Cloudflare (Orange Cloud) berdasarkan range IP dan header response.
+7. **Origin Verification**: Memastikan domain yang menggunakan Cloudflare benar-benar mengarah ke IP server asli kita dengan melakukan direct request menggunakan Host header spoofing.
 
 > Catatan: domain expired berarti pendaftaran nama domain sudah berakhir di registrar/registry. Ini berbeda dengan SSL expired, yang mengacu pada sertifikat HTTPS website.
 
@@ -48,13 +49,35 @@ go run . -domain domainkita.com -origin 123.123.123.123
 ```
 Fungsi: selain cek umum, program akan mengecek apakah IP yang Anda masukkan memang benar menjadi origin server untuk domain tersebut.
 
-### 3) Build menjadi binary
+### 3) Cek uptime cepat
+```bash
+go run . -domain example.com
+```
+Atau bisa langsung ke URL tertentu:
+```bash
+go run . -domain example.com -url https://example.com
+```
+Fungsi: memeriksa HTTP status endpoint dengan cepat, misalnya `200 OK`, `301`, `404`, atau `500`.
+
+### 4) Cek dari file konfigurasi `config/config.yml`
+```bash
+go run . -domain example.com -config config/config.yml
+```
+Contoh isi file `config/config.yml`:
+```yaml
+uptime:
+  - https://example.com
+  - https://example.org
+```
+Program hanya membaca file config jika `-config` diisi eksplisit. Tanpa itu, uptime hanya mengecek `https://<domain>` itu sendiri.
+
+### 5) Build menjadi binary
 ```bash
 go build -o checkdomain main.go
 ./checkdomain -domain example.com
 ```
 
-### 4) Contoh domain yang sering dipakai
+### 6) Contoh domain yang sering dipakai
 ```bash
 go run . -domain google.com
 go run . -domain batannyuh.desa.id
@@ -63,6 +86,8 @@ go run . -domain yourdomain.com -origin 1.2.3.4
 
 ### Penjelasan parameter
 - `-domain`: nama domain yang akan dicek
+- `-url`: URL khusus untuk pengecekan uptime cepat
+- `-config`: path file konfigurasi YAML yang berisi daftar URL yang akan dipantau
 - `-origin`: IP server asal (origin) yang ingin diverifikasi untuk domain tertentu
 
 ## Output yang ditampilkan
@@ -82,7 +107,10 @@ Tool akan mencoba koneksi ke port 443 dan membaca sertifikat TLS dari domain. Ji
 ### 2) Cek domain expired atau masih aktif
 Tool akan melakukan query ke WHOIS server domain untuk membaca tanggal expiry/renewal. Jika data bisa dibaca, program akan menampilkan status `Active` atau `EXPIRED` dan sisa hari sampai masa berakhirnya domain. Ini membantu mengetahui apakah nama domain berstatus expired di registrar.
 
-### 3) NS Lookup
+### 3) Quick Uptime Check
+Tool akan melakukan request HTTP ke URL target dalam waktu singkat dan menampilkan statusnya. Misalnya `200 OK` berarti sukses, sedangkan `500` berarti server error. Ini sangat cocok untuk pengecekan cepat tanpa harus menunggu terlalu lama.
+
+### 4) NS Lookup
 Tool akan melakukan query DNS untuk menampilkan daftar Nameserver (NS) yang bertanggung jawab atas domain tersebut. Ini berguna untuk mengecek apakah domain ada di provider DNS yang benar.
 
 ## Contoh Output
@@ -95,7 +123,9 @@ Tool akan melakukan query DNS untuk menampilkan daftar Nameserver (NS) yang bert
    ⏳ Sisa:    85 hari
 📅 Domain Expiry: ✅ Active (berlaku sampai 2027-08-13)
    ⏳ Sisa:    316 hari
-🧭 NS Lookup:
+� Uptime Check:
+   - https://example.com -> ✅ 200 OK
+�🧭 NS Lookup:
    - ns1.example.com.
    - ns2.example.com.
 🌐 DNS Pointing:
